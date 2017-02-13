@@ -20,8 +20,7 @@ const (
 )
 
 var (
-	payloadHello = []ninchat.Frame{[]byte{}, []byte{}}
-	payloadEOF   = []ninchat.Frame{[]byte{}}
+	payloadHello = []ninchat.Frame{[]byte{}}
 )
 
 func main() {
@@ -30,11 +29,16 @@ func main() {
 
 	var (
 		myUserId   string
+		myUserAuth string
 		peerUserId string
+		channelId  string
 		executable string
 	)
 
-	flag.StringVar(&peerUserId, "peer", peerUserId, "peer user id")
+	flag.StringVar(&myUserId, "user", myUserId, "login with existing user id (needs -auth)")
+	flag.StringVar(&myUserAuth, "auth", myUserAuth, "user authentication token")
+	flag.StringVar(&peerUserId, "peer", peerUserId, "peer user id (if dialogue peer is already known, or for filtering channel messages")
+	flag.StringVar(&channelId, "channel", channelId, "use channel instead of dialogue (needs -user)")
 	flag.StringVar(&executable, "exec", executable, "executable to run")
 	flag.Parse()
 
@@ -71,11 +75,18 @@ func main() {
 		},
 	}
 
-	session.SetParams(map[string]interface{}{
+	params := map[string]interface{}{
 		"message_types": []string{
 			messageType,
 		},
-	})
+	}
+
+	if myUserId != "" {
+		params["user_id"] = myUserId
+		params["user_auth"] = myUserAuth
+	}
+
+	session.SetParams(params)
 
 	session.Open()
 
@@ -97,6 +108,10 @@ func main() {
 
 	defer cancel()
 
+	var (
+		sessionCreated bool
+	)
+
 	for {
 		select {
 		case event := <-events:
@@ -107,42 +122,60 @@ func main() {
 				return
 
 			case "session_created":
-				if myUserId != "" {
+				if sessionCreated {
 					log.Print("session lost")
 					return
 				}
 
+				sessionCreated = true
 				myUserId, _ = event.Str("user_id")
 
-				if peerUserId != "" {
-					go sendLoop(ctx, cancel, r, session, peerUserId)
+				if channelId != "" {
+					if myUserAuth != "" {
+						go sendLoop(ctx, cancel, r, session, "", channelId)
+					} else {
+						follow(session, channelId)
+					}
+				} else if peerUserId != "" {
+					send(session, peerUserId, "", false, 60, payloadHello)
+					go sendLoop(ctx, cancel, r, session, peerUserId, "")
 				} else {
 					log.Printf("my user id: %s", myUserId)
 				}
 
 			case "message_received":
-				if x, _ := event.Str("message_user_id"); x == myUserId {
+				if x, ok := event.Str("message_user_id"); ok && x == myUserId {
 					// reply
 					break
 				}
 
-				if userId, _ := event.Str("user_id"); userId != "" {
-					if peerUserId == "" {
-						peerUserId = userId
-						go sendLoop(ctx, cancel, r, session, peerUserId)
-					}
+				var forMe bool
 
-					if userId == peerUserId {
-						if len(event.Payload) == 1 && len(event.Payload[0]) == 0 {
-							// EOF
-							return
+				if channelId != "" {
+					if x, _ := event.Str("channel_id"); x == channelId {
+						if peerUserId == "" {
+							forMe = true
+						} else {
+							x, _ := event.Str("message_user_id")
+							forMe = (x == peerUserId)
+						}
+					}
+				} else {
+					if x, ok := event.Str("user_id"); ok {
+						if peerUserId == "" {
+							peerUserId = x
+							go sendLoop(ctx, cancel, r, session, peerUserId, "")
 						}
 
-						for _, data := range event.Payload {
-							if _, err := w.Write(data); err != nil {
-								log.Printf("output: %v", err)
-								return
-							}
+						forMe = (x == peerUserId)
+					}
+				}
+
+				if forMe {
+					for _, data := range event.Payload {
+						if _, err := w.Write(data); err != nil {
+							log.Printf("output: %v", err)
+							return
 						}
 					}
 				}
@@ -155,11 +188,8 @@ func main() {
 	}
 }
 
-func sendLoop(ctx context.Context, cancel context.CancelFunc, r io.Reader, session *ninchat.Session, peerUserId string) {
+func sendLoop(ctx context.Context, cancel context.CancelFunc, r io.Reader, session *ninchat.Session, peerUserId, channelId string) {
 	defer cancel()
-
-	send(session, peerUserId, false, 60, payloadHello)
-	defer send(session, peerUserId, false, 60, payloadEOF)
 
 	for {
 		select {
@@ -199,20 +229,36 @@ func sendLoop(ctx context.Context, cancel context.CancelFunc, r io.Reader, sessi
 			payload[i] = buf[begin:end]
 		}
 
-		send(session, peerUserId, true, messageTTL, payload)
+		send(session, peerUserId, channelId, true, messageTTL, payload)
 	}
 }
 
-func send(session *ninchat.Session, peerUserId string, fold bool, ttl interface{}, payload []ninchat.Frame) {
+func follow(session *ninchat.Session, channelId string) {
 	session.Send(&ninchat.Action{
 		Params: map[string]interface{}{
-			"action":       "send_message",
-			"action_id":    nil,
-			"user_id":      peerUserId,
-			"message_type": messageType,
-			"message_fold": fold,
-			"message_ttl":  ttl,
+			"action":     "follow_channel",
+			"channel_id": channelId,
 		},
+	})
+}
+
+func send(session *ninchat.Session, peerUserId, channelId string, fold bool, ttl interface{}, payload []ninchat.Frame) {
+	params := map[string]interface{}{
+		"action":       "send_message",
+		"action_id":    nil,
+		"message_type": messageType,
+		"message_fold": fold,
+		"message_ttl":  ttl,
+	}
+
+	if channelId != "" {
+		params["channel_id"] = channelId
+	} else {
+		params["user_id"] = peerUserId
+	}
+
+	session.Send(&ninchat.Action{
+		Params:  params,
 		Payload: payload,
 	})
 }
