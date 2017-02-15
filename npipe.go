@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"flag"
@@ -13,10 +14,10 @@ import (
 )
 
 const (
-	messageType = "github.com/tsavola/npipe"
-	messageTTL  = 0.1
-	maxPartSize = 32 * 1024
-	maxSize     = 32 * maxPartSize
+	messageTypePrefix = "github.com/tsavola/npipe/"
+	messageTTL        = 0.1
+	maxPartSize       = 32 * 1024
+	maxSize           = 32 * maxPartSize
 )
 
 var (
@@ -77,7 +78,7 @@ func main() {
 
 	params := map[string]interface{}{
 		"message_types": []string{
-			messageType,
+			messageTypePrefix + "*",
 		},
 	}
 
@@ -137,7 +138,7 @@ func main() {
 						follow(session, channelId)
 					}
 				} else if peerUserId != "" {
-					send(session, peerUserId, "", false, 60, payloadHello)
+					send(session, peerUserId, "", nil, false, 60, payloadHello)
 					go sendLoop(ctx, cancel, r, session, peerUserId, "")
 				} else {
 					log.Printf("my user id: %s", myUserId)
@@ -198,7 +199,7 @@ func sendLoop(ctx context.Context, cancel context.CancelFunc, r io.Reader, sessi
 		default:
 		}
 
-		header := make([]byte, 4)
+		header := make([]byte, 8)
 		if _, err := io.ReadFull(r, header); err != nil {
 			if err != io.EOF {
 				log.Printf("input: %v", err)
@@ -207,14 +208,16 @@ func sendLoop(ctx context.Context, cancel context.CancelFunc, r io.Reader, sessi
 		}
 
 		size := binary.LittleEndian.Uint32(header)
-		if size < 4 || size > maxSize {
+		if size < 8 || size > maxSize {
 			log.Printf("input: message size out of bounds: %d", size)
 			return
 		}
 
+		typeId := header[4:]
+
 		buf := make([]byte, size)
 		copy(buf, header)
-		if _, err := io.ReadFull(r, buf[4:]); err != nil {
+		if _, err := io.ReadFull(r, buf[8:]); err != nil {
 			log.Printf("input: %v", err)
 			return
 		}
@@ -229,7 +232,7 @@ func sendLoop(ctx context.Context, cancel context.CancelFunc, r io.Reader, sessi
 			payload[i] = buf[begin:end]
 		}
 
-		send(session, peerUserId, channelId, true, messageTTL, payload)
+		send(session, peerUserId, channelId, typeId, true, messageTTL, payload)
 	}
 }
 
@@ -242,11 +245,21 @@ func follow(session *ninchat.Session, channelId string) {
 	})
 }
 
-func send(session *ninchat.Session, peerUserId, channelId string, fold bool, ttl interface{}, payload []ninchat.Frame) {
+func send(session *ninchat.Session, peerUserId, channelId string, typeId []byte, fold bool, ttl interface{}, payload []ninchat.Frame) {
+	var typeSuffix []byte
+
+	for i := len(typeId) - 1; i >= 0; i-- {
+		if n := typeId[i]; n >= 48 && n <= 126 {
+			typeSuffix = append(typeSuffix, n)
+		}
+	}
+
+	typeId = bytes.TrimRight(typeId, ".")
+
 	params := map[string]interface{}{
 		"action":       "send_message",
 		"action_id":    nil,
-		"message_type": messageType,
+		"message_type": messageTypePrefix + string(typeSuffix),
 		"message_fold": fold,
 		"message_ttl":  ttl,
 	}
